@@ -439,12 +439,136 @@ bool startPrintFromRemoteHost(const char * filename)
   return true;
 }
 
+// Transfer file from TFT SD to RRF host via M28/M29 sequence
+// This function sends the file content to the RRF host which will save it to its SD card
+static bool transferFileToRRFHost(void)
+{
+  FIL file;
+  UINT bytes_read = 0;
+  char line_buffer[256];
+  char filename[100];
+  char tempMsg[MAX_MSG_LENGTH];
+  const char * name = strrchr(infoFile.path, '/');
+
+  // Open file from TFT SD
+  if (f_open(&file, infoFile.path, FA_OPEN_EXISTING | FA_READ) != FR_OK)
+    return false;
+
+  infoPrinting.size = f_size(&file);
+  if (infoPrinting.size == 0)
+  {
+    f_close(&file);
+    return false;
+  }
+
+  // RRF expects a host-side path. Keep it normalized as "/filename.gcode"
+  // so the same value can be reused consistently for M28 and M32.
+  if (name == NULL)
+    name = getPrintFilename();
+  else
+    name++;  // skip the slash found in infoFile.path
+
+  snprintf(filename, sizeof(filename), "/%s", name);
+
+  // Show a splash before the blocking transfer starts so the user knows
+  // the TFT is uploading the selected file to the RRF host.
+  snprintf(tempMsg, MAX_MSG_LENGTH, "Transferring file...\n%s", name);
+  popupSplash(DIALOG_TYPE_INFO, LABEL_PRINT, tempMsg);
+  loopPopup();
+
+  // Pause periodic status queries (M27) to avoid interference with file transfer
+  // by clearing the auto report flag temporarily
+  uint8_t saved_autoReport = infoMachineSettings.autoReportSDStatus;
+  infoMachineSettings.autoReportSDStatus = DISABLED;
+
+  // Send M28 command to start file writing on host
+  mustStoreCmd("M28 %s\n", filename);
+
+  // Wait for command queue to be processed and command to be transmitted
+  // This gives the host time to prepare for receiving file data
+  Delay_ms(200);
+
+  // Read file line-by-line and send to host
+  // After M28, RRF expects to receive file content line by line
+  uint32_t total_sent = 0;
+  while (!f_eof(&file) && total_sent < infoPrinting.size)
+  {
+    // Read a line from the file
+    int line_len = 0;
+
+    while (line_len < (int)sizeof(line_buffer) - 1)
+    {
+      uint8_t byte;
+
+      if (f_read(&file, &byte, 1, &bytes_read) != FR_OK || bytes_read == 0)
+        break;
+
+      line_buffer[line_len++] = byte;
+      total_sent++;
+
+      if (byte == '\n')
+        break;
+    }
+
+    if (line_len > 0)
+    {
+      line_buffer[line_len] = '\0';
+      // Send the line to the host
+      // Serial_Put will handle the transmission via the TX buffer
+      Serial_Put(SERIAL_PORT, line_buffer);
+
+      // Small delay to let data process
+      Delay_ms(5);
+    }
+  }
+
+  f_close(&file);
+
+  // Wait a bit for all data to be transmitted
+  Delay_ms(200);
+
+  // Send M29 command to complete file writing on host
+  mustStoreCmd("M29\n");
+
+  // Wait for M29 to be processed
+  Delay_ms(100);
+
+  // Restore periodic status queries
+  infoMachineSettings.autoReportSDStatus = saved_autoReport;
+
+  // Send M32 command to start printing from the file we just transferred
+  mustStoreCmd("M32 %s\n", filename);
+
+  return true;
+}
+
 bool startPrint(void)
 {
   bool printRestore = false;
 
   // always clean infoPrinting first and then set the needed attributes
   clearInfoPrint();
+
+  // Special handling for RRF with TFT SD: transfer file to RRF host
+  if (infoMachineSettings.firmwareType == FW_REPRAPFW && 
+      (infoFile.source == FS_TFT_SD || infoFile.source == FS_TFT_USB))
+  {
+    if (transferFileToRRFHost())
+    {
+      infoPrinting.printing = true;
+      infoPrinting.cur = 0;
+      
+      // execute pre print start tasks
+      if (GET_BIT(infoSettings.send_gcodes, SEND_GCODES_START_PRINT))
+        sendPrintCodes(0);
+      
+      initPrintSummary();  // init print summary as last (it requires infoFile to be properly set)
+      
+      return true;
+    }
+    
+    return false;
+  }
 
   switch (infoFile.source)
   {
